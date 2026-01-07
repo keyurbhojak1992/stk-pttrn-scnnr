@@ -9,6 +9,7 @@ import io
 import os
 import re
 import json
+import time  # <--- Added to fix Rate Limit Error
 
 # --- 1. CONFIGURATION & SETUP ---
 st.set_page_config(page_title="ProTrade: Master Scanner", layout="wide")
@@ -31,7 +32,7 @@ def load_watchlists():
     # Fallback if file missing
     return {"Default": ["RELIANCE", "TCS", "INFY"]}
 
-# --- 3. ULTIMATE DATA FETCHER (PRESERVED) ---
+# --- 3. ULTIMATE DATA FETCHER (FIXED) ---
 def get_valid_data(ticker):
     """
     Smart fetch: Tries Ticker -> Ticker.NS -> Ticker.BO -> US Ticker
@@ -52,14 +53,22 @@ def get_valid_data(ticker):
     
     for symbol in variations:
         try:
+            # FIX 1: Add delay to avoid Rate Limit Error
+            time.sleep(0.5) 
+            
             data = yf.download(symbol, period="1y", interval="1d", progress=False)
+            
+            # FIX 2: Flatten MultiIndex (Fixes AttributeError for pandas_ta)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            
             if not data.empty and len(data) > 50:
                 return data, symbol
-        except:
+        except Exception:
             continue
     return None, None
 
-# --- 4. STANDARD MATH LOGIC ENGINE (NEW & COMPLETE) ---
+# --- 4. STANDARD MATH LOGIC ENGINE ---
 def analyze_pattern_math(df, pattern_name):
     """
     The 'Standard' Logic. Returns a Setup Dict if criteria met.
@@ -77,7 +86,6 @@ def analyze_pattern_math(df, pattern_name):
 
     # === LOGIC: FLAG AND POLE ===
     if pattern_name == "Flag & Pole":
-        # 1. THE POLE: Sharp 15%+ rise in past 15-40 days
         lookback_pole = 25
         start_price = close.iloc[-lookback_pole]
         peak_price = high.tail(lookback_pole).max()
@@ -85,13 +93,10 @@ def analyze_pattern_math(df, pattern_name):
         pole_move = (peak_price - start_price) / start_price
         
         if pole_move > 0.15:  # Pole exists (>15% gain)
-            # 2. THE FLAG: Consolidation in top 30% of the pole
-            # Get recent data after the peak
-            recent_consolidation = df.tail(10) # Last 10 days
-            flag_high = recent_consolidation['High'].max()
+            recent_consolidation = df.tail(10) 
             flag_low = recent_consolidation['Low'].min()
+            flag_high = recent_consolidation['High'].max()
             
-            # Check if we are holding up (not dropping below 50% of pole)
             retracement_limit = peak_price - (0.5 * (peak_price - start_price))
             
             if flag_low > retracement_limit:
@@ -103,15 +108,14 @@ def analyze_pattern_math(df, pattern_name):
 
     # === LOGIC: TIGHT BASE / BOX ===
     elif pattern_name == "Tight Base" or pattern_name == "Box Pattern":
-        # Price range < 10% for last 20 days
         lookback = 20
         box_high = high.tail(lookback).max()
         box_low = low.tail(lookback).min()
         
         range_pct = (box_high - box_low) / box_low
         
-        if range_pct < 0.10: # Extremely tight (<10% range)
-            if current_price > sma50: # Must be in uptrend
+        if range_pct < 0.10: 
+            if current_price > sma50: 
                 setup["Match"] = True
                 setup["Entry"] = round(box_high * 1.005, 2)
                 setup["Stop"] = round(box_low * 0.99, 2)
@@ -120,12 +124,10 @@ def analyze_pattern_math(df, pattern_name):
 
     # === LOGIC: VCP (Volatility Contraction) ===
     elif pattern_name == "VCP":
-        # Check contraction in last 2 swings
-        # 1. Big swing (20 days ago) vs 2. Small swing (10 days ago)
         range_big = high.tail(20).max() - low.tail(20).min()
         range_small = high.tail(10).max() - low.tail(10).min()
         
-        if range_small < (range_big * 0.7): # Volatility drying up
+        if range_small < (range_big * 0.7): 
             if current_price > sma200:
                 setup["Match"] = True
                 pivot = high.tail(5).max()
@@ -136,9 +138,8 @@ def analyze_pattern_math(df, pattern_name):
 
     return setup
 
-# --- 5. IMAGE MATCHING ENGINE (PRESERVED) ---
+# --- 5. IMAGE MATCHING ENGINE ---
 def analyze_pattern_visual(df, folder_path):
-    # (Same OpenCV logic as previous - keeping it safe as requested)
     buf = io.BytesIO()
     try:
         mpf.plot(df.tail(60), type='line', linecolor='black', axisoff=True, volume=False, savefig=buf)
@@ -177,7 +178,6 @@ with st.sidebar:
     st.header("1. Strategy")
     mode = st.radio("Scan Mode:", ["Standard Math (Logic)", "Visual Match (Images)"])
     
-    # Dynamic Pattern Selection based on Mode
     if mode == "Standard Math (Logic)":
         pattern_choice = st.selectbox("Select Pattern:", ["Flag & Pole", "Tight Base", "VCP", "Box Pattern"])
     else:
@@ -207,11 +207,10 @@ if run and tickers:
     for i, t in enumerate(tickers):
         data, valid_symbol = get_valid_data(t)
         if data is not None:
-            # Global Safety (Must be above 200 SMA)
+            # Global Safety 
             sma200 = data.ta.sma(length=200).iloc[-1] if len(data) > 200 else 0
             if data['Close'].iloc[-1] > sma200:
                 
-                # --- DECISION LOGIC ---
                 match = False
                 setup = {}
                 
@@ -222,7 +221,6 @@ if run and tickers:
                         setup = res
                         setup["Score"] = "Math Verified"
                 else:
-                    # Image Mode
                     folder = PATTERN_FOLDERS.get(pattern_choice)
                     if folder:
                         score = analyze_pattern_visual(data, folder)
@@ -254,7 +252,6 @@ if run and tickers:
         st.success(f"Found {len(results)} matches!")
         st.dataframe(df_res)
         
-        # Chart Viewer
         st.divider()
         sel = st.selectbox("Inspect Chart:", df_res['Ticker'].tolist())
         if sel:
