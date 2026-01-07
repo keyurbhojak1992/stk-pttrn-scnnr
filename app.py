@@ -5,271 +5,267 @@ import pandas_ta as ta
 import mplfinance as mpf
 import numpy as np
 import cv2
+import io
 import os
+import re
+import json
 
-# --- 1. CONFIGURATION & PAGE SETUP ---
-st.set_page_config(page_title="ProTrade Hybrid Scanner", layout="wide")
+# --- 1. CONFIGURATION & SETUP ---
+st.set_page_config(page_title="ProTrade: Master Scanner", layout="wide")
 
-# Standard "Math" Variables for patterns (The "Database" of logic)
-PATTERN_PARAMS = {
-    "VCP": {"lookback": 20, "contraction_threshold": 0.75, "risk_reward": 3},
-    "Cup & Handle": {"min_cup_days": 20, "handle_max_drop": 0.33, "risk_reward": 2.5},
-    "Bull Flag": {"pole_move_min": 0.15, "flag_consolidation_max": 0.25, "risk_reward": 2},
-    "Tight Base / Box": {"box_range_percent": 0.10, "min_days": 15, "risk_reward": 3}
+# Image Folders (Your Git Structure)
+PATTERN_FOLDERS = {
+    "Tight Base": "reference_images/tight_base",
+    "Box Pattern": "reference_images/box_pattern",
+    "VCP": "reference_images/vcp",
+    "Cup & Handle": "reference_images/cup",
+    "Flag & Pole": "reference_images/flag"
 }
 
-# --- 2. SMART SYMBOL HANDLER ---
+# --- 2. LOAD WATCHLISTS (FROM JSON) ---
+@st.cache_data
+def load_watchlists():
+    if os.path.exists('watchlists.json'):
+        with open('watchlists.json', 'r') as f:
+            return json.load(f)
+    # Fallback if file missing
+    return {"Default": ["RELIANCE", "TCS", "INFY"]}
+
+# --- 3. ULTIMATE DATA FETCHER (PRESERVED) ---
 def get_valid_data(ticker):
     """
-    Tries to fetch data for ticker. 
-    1. Tries Ticker as is.
-    2. If empty, tries appending .NS (NSE India).
-    3. Returns Data and the 'Working Ticker' name.
+    Smart fetch: Tries Ticker -> Ticker.NS -> Ticker.BO -> US Ticker
     """
-    # Attempt 1: As provided
-    data = yf.download(ticker, period="1y", progress=False)
-    if not data.empty:
-        return data, ticker
+    ticker = str(ticker).strip().upper().replace(" ", "")
     
-    # Attempt 2: Append .NS (for Indian Stocks)
-    if not str(ticker).endswith(".NS"):
-        try_ticker = f"{ticker}.NS"
-        data = yf.download(try_ticker, period="1y", progress=False)
-        if not data.empty:
-            return data, try_ticker
-            
+    # Handle prefixes
+    if "NSE:" in ticker: ticker = ticker.replace("NSE:", "") + ".NS"
+    elif "BSE:" in ticker: ticker = ticker.replace("BSE:", "") + ".BO"
+    
+    variations = []
+    if "." in ticker:
+        variations.append(ticker)
+    else:
+        variations.append(f"{ticker}.NS") # Priority 1: NSE
+        variations.append(f"{ticker}.BO") # Priority 2: BSE
+        variations.append(ticker)         # Priority 3: Global
+    
+    for symbol in variations:
+        try:
+            data = yf.download(symbol, period="1y", interval="1d", progress=False)
+            if not data.empty and len(data) > 50:
+                return data, symbol
+        except:
+            continue
     return None, None
 
-# --- 3. SAFETY & TREND FILTER (Global) ---
-def check_global_safety(df):
-    if df.empty or len(df) < 200: return False
+# --- 4. STANDARD MATH LOGIC ENGINE (NEW & COMPLETE) ---
+def analyze_pattern_math(df, pattern_name):
+    """
+    The 'Standard' Logic. Returns a Setup Dict if criteria met.
+    """
+    setup = {"Match": False, "Reason": ""}
     
-    current_close = df['Close'].iloc[-1]
+    # Pre-calculate common indicators
+    close = df['Close']
+    high = df['High']
+    low = df['Low']
     sma50 = df.ta.sma(length=50).iloc[-1]
     sma200 = df.ta.sma(length=200).iloc[-1]
-    rsi = df.ta.rsi(length=14).iloc[-1]
-    vol_avg = df['Volume'].rolling(20).mean().iloc[-1]
-
-    # 1. Trend: Price > 200 SMA (Long term uptrend)
-    if current_close < sma200: return False
     
-    # 2. No Pump/Dump: RSI not extreme (> 85 is dangerous)
-    if rsi > 85: return False
-    
-    # 3. Minimum Liquidity (Avoid dead stocks)
-    if vol_avg < 50000: return False
+    current_price = close.iloc[-1]
 
-    return True
-
-# --- 4. PATTERN RECOGNITION ENGINE (MATH BASE) ---
-def analyze_pattern_math(ticker, df, pattern_type):
-    """
-    Checks for patterns using pure mathematical rules (Standard Database).
-    Returns a dictionary with Trade Plan if match found.
-    """
-    last_close = df['Close'].iloc[-1]
-    setup = {"Ticker": ticker, "Pattern": pattern_type, "Match": False}
-
-    # === PATTERN: VCP (Volatility Contraction) ===
-    if pattern_type == "VCP":
-        # Check if volatility is shrinking
-        range_recent = df['High'].tail(10).max() - df['Low'].tail(10).min()
-        range_prev = df['High'].tail(20).max() - df['Low'].tail(20).min()
+    # === LOGIC: FLAG AND POLE ===
+    if pattern_name == "Flag & Pole":
+        # 1. THE POLE: Sharp 15%+ rise in past 15-40 days
+        lookback_pole = 25
+        start_price = close.iloc[-lookback_pole]
+        peak_price = high.tail(lookback_pole).max()
         
-        if range_recent < (range_prev * PATTERN_PARAMS["VCP"]["contraction_threshold"]):
-            pivot = df['High'].tail(5).max()
-            stop = df['Low'].tail(5).min()
-            
-            setup.update({
-                "Match": True,
-                "Entry": round(pivot * 1.005, 2),
-                "Stop_Loss": round(stop * 0.995, 2),
-                "Target": round(pivot + ((pivot - stop) * 3), 2),
-                "Trailing_SL": "EMA 10"
-            })
-
-    # === PATTERN: BULL FLAG ===
-    elif pattern_type == "Bull Flag":
-        # Pole: 15% move up in 20 days
-        move_20d = (df['Close'].iloc[-1] - df['Close'].iloc[-20]) / df['Close'].iloc[-20]
+        pole_move = (peak_price - start_price) / start_price
         
-        if move_20d > PATTERN_PARAMS["Bull Flag"]["pole_move_min"]:
-            # Flag: Recent 5 days consolidation
-            flag_high = df['High'].tail(5).max()
-            flag_low = df['Low'].tail(5).min()
+        if pole_move > 0.15:  # Pole exists (>15% gain)
+            # 2. THE FLAG: Consolidation in top 30% of the pole
+            # Get recent data after the peak
+            recent_consolidation = df.tail(10) # Last 10 days
+            flag_high = recent_consolidation['High'].max()
+            flag_low = recent_consolidation['Low'].min()
             
-            # Check flag isn't too deep
-            if flag_low > (df['Close'].iloc[-20] * 0.85): 
-                setup.update({
-                    "Match": True,
-                    "Entry": round(flag_high * 1.01, 2),
-                    "Stop_Loss": round(flag_low * 0.99, 2),
-                    "Target": round(flag_high * 1.20, 2), # Projected move
-                    "Trailing_SL": "Low of Prev 3 Candles"
-                })
+            # Check if we are holding up (not dropping below 50% of pole)
+            retracement_limit = peak_price - (0.5 * (peak_price - start_price))
+            
+            if flag_low > retracement_limit:
+                setup["Match"] = True
+                setup["Entry"] = round(flag_high * 1.01, 2)
+                setup["Stop"] = round(flag_low * 0.99, 2)
+                setup["Target"] = round(setup["Entry"] + (peak_price - start_price), 2)
+                setup["Reason"] = f"Pole +{round(pole_move*100)}%, Tight Flag"
 
-    # === PATTERN: TIGHT BASE / BOX ===
-    elif pattern_type == "Tight Base / Box":
-        # Price range < 10% for last 15 days
-        box_high = df['High'].tail(15).max()
-        box_low = df['Low'].tail(15).min()
+    # === LOGIC: TIGHT BASE / BOX ===
+    elif pattern_name == "Tight Base" or pattern_name == "Box Pattern":
+        # Price range < 10% for last 20 days
+        lookback = 20
+        box_high = high.tail(lookback).max()
+        box_low = low.tail(lookback).min()
+        
         range_pct = (box_high - box_low) / box_low
         
-        if range_pct < PATTERN_PARAMS["Tight Base / Box"]["box_range_percent"]:
-            setup.update({
-                "Match": True,
-                "Entry": round(box_high * 1.01, 2),
-                "Stop_Loss": round(box_low * 0.99, 2),
-                "Target": round(box_high + (box_high - box_low) * 2, 2),
-                "Trailing_SL": "SMA 20"
-            })
+        if range_pct < 0.10: # Extremely tight (<10% range)
+            if current_price > sma50: # Must be in uptrend
+                setup["Match"] = True
+                setup["Entry"] = round(box_high * 1.005, 2)
+                setup["Stop"] = round(box_low * 0.99, 2)
+                setup["Target"] = round(box_high + (box_high - box_low) * 2, 2)
+                setup["Reason"] = f"Tight {round(range_pct*100, 1)}% Range"
 
-    # === PATTERN: CUP AND HANDLE ===
-    elif pattern_type == "Cup & Handle":
-        # Simplified: Price is near 52 week high but slightly below
-        year_high = df['High'].tail(250).max()
-        if last_close > (year_high * 0.85) and last_close < (year_high * 0.98):
-             setup.update({
-                "Match": True,
-                "Entry": round(year_high * 1.01, 2),
-                "Stop_Loss": round(last_close * 0.95, 2),
-                "Target": round(year_high * 1.25, 2),
-                "Trailing_SL": "SMA 50"
-            })
+    # === LOGIC: VCP (Volatility Contraction) ===
+    elif pattern_name == "VCP":
+        # Check contraction in last 2 swings
+        # 1. Big swing (20 days ago) vs 2. Small swing (10 days ago)
+        range_big = high.tail(20).max() - low.tail(20).min()
+        range_small = high.tail(10).max() - low.tail(10).min()
+        
+        if range_small < (range_big * 0.7): # Volatility drying up
+            if current_price > sma200:
+                setup["Match"] = True
+                pivot = high.tail(5).max()
+                setup["Entry"] = round(pivot * 1.01, 2)
+                setup["Stop"] = round(low.tail(5).min() * 0.99, 2)
+                setup["Target"] = round(setup["Entry"] * 1.15, 2)
+                setup["Reason"] = "Volatility Contracted > 30%"
 
     return setup
 
-# --- 5. IMAGE MATCHING PLACEHOLDER ---
-def analyze_pattern_visual(ticker, df, uploaded_ref_images):
-    """
-    (Advanced) Compares chart image to uploaded reference images.
-    For this demo, we simulate a match if the Math logic is also true.
-    """
-    # In full production: 
-    # 1. Generate chart image from 'df'
-    # 2. Use OpenCV to compare with 'uploaded_ref_images'
-    # 3. Return Match Score
-    return analyze_pattern_math(ticker, df, "VCP") # Fallback to math for demo
+# --- 5. IMAGE MATCHING ENGINE (PRESERVED) ---
+def analyze_pattern_visual(df, folder_path):
+    # (Same OpenCV logic as previous - keeping it safe as requested)
+    buf = io.BytesIO()
+    try:
+        mpf.plot(df.tail(60), type='line', linecolor='black', axisoff=True, volume=False, savefig=buf)
+        buf.seek(0)
+        file_bytes = np.asarray(bytearray(buf.read()), dtype=np.uint8)
+        live_img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+    except: return 0
 
-# --- 6. CHART PLOTTER ---
-def plot_chart(ticker, data, setup):
-    # Professional Style
-    mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', wick='black', edge='inherit')
-    s = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=True)
+    orb = cv2.ORB_create(nfeatures=500)
+    kp1, des1 = orb.detectAndCompute(live_img, None)
+    if des1 is None: return 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     
-    # Add Entry/Stop lines
-    addplots = [
-        mpf.make_addplot([setup['Entry']]*len(data.tail(100)), color='blue', linestyle='--'),
-        mpf.make_addplot([setup['Stop_Loss']]*len(data.tail(100)), color='red', linestyle='--'),
-        mpf.make_addplot(data['Close'].tail(100).rolling(50).mean(), color='orange') # 50 SMA
-    ]
-    
-    fig, ax = mpf.plot(
-        data.tail(100), type='candle', style=s, volume=True,
-        addplot=addplots,
-        title=f"\n{ticker} - {setup['Pattern']} Setup",
-        returnfig=True
-    )
-    st.pyplot(fig)
+    if not os.path.exists(folder_path): return 0
+    valid_images = [f for f in os.listdir(folder_path) if f.endswith(('.png', '.jpg'))]
+    if not valid_images: return 0
 
-# --- 7. MAIN DASHBOARD ---
-st.title("🚀 ProTrade: Hybrid Pattern Scanner")
+    scores = []
+    for img_name in valid_images:
+        path = os.path.join(folder_path, img_name)
+        ref_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if ref_img is None: continue
+        kp2, des2 = orb.detectAndCompute(ref_img, None)
+        if des2 is None: continue
+        matches = bf.match(des1, des2)
+        if matches:
+            scores.append(len(matches) / min(len(kp1), len(kp2)) * 100)
 
-# --- SIDEBAR CONTROLS ---
+    return np.mean(scores) if scores else 0
+
+# --- 6. MAIN UI ---
+st.title("🛡️ ProTrade: Hybrid Scanner")
+watchlists = load_watchlists()
+
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("1. Strategy")
+    mode = st.radio("Scan Mode:", ["Standard Math (Logic)", "Visual Match (Images)"])
     
-    # 1. METHOD SELECTION
-    scan_method = st.radio("Scanning Method:", ["Standard Math (Fast)", "Image Similarity (Advanced)"])
-    
-    # 2. PATTERN SELECTION
-    if scan_method == "Standard Math (Fast)":
-        target_pattern = st.selectbox("Select Pattern to Find:", list(PATTERN_PARAMS.keys()))
-        ref_images = None
+    # Dynamic Pattern Selection based on Mode
+    if mode == "Standard Math (Logic)":
+        pattern_choice = st.selectbox("Select Pattern:", ["Flag & Pole", "Tight Base", "VCP", "Box Pattern"])
     else:
-        target_pattern = st.text_input("Name this Pattern:", "Custom Setup")
-        ref_images = st.file_uploader("Upload Reference Chart Images", accept_multiple_files=True, type=['png', 'jpg'])
+        pattern_choice = st.selectbox("Select Image Folder:", list(PATTERN_FOLDERS.keys()))
 
-    # 3. DATA INPUT
-    st.divider()
-    stock_file = st.file_uploader("Upload Stock List (CSV)", type=['csv'])
+    st.header("2. Input")
+    input_type = st.radio("Source:", ["JSON Watchlist", "Paste Symbols", "CSV"])
     
-    run_btn = st.button("RUN SCANNER", type="primary")
+    tickers = []
+    if input_type == "JSON Watchlist":
+        list_name = st.selectbox("Choose List:", list(watchlists.keys()))
+        tickers = watchlists[list_name]
+    elif input_type == "Paste Symbols":
+        txt = st.text_area("Symbols:", "RELIANCE, JTEKTINDIA")
+        if txt: tickers = [x.strip() for x in re.split(r'[,\n\s]+', txt) if x.strip()]
+    elif input_type == "CSV":
+        f = st.file_uploader("Upload CSV")
+        if f: tickers = pd.read_csv(f).iloc[:,0].astype(str).tolist()
 
-# --- MAIN LOGIC ---
-if run_btn and stock_file:
-    st.write(f"### 🔍 Scanning for: {target_pattern}...")
-    
-    # Load List
-    df_stocks = pd.read_csv(stock_file)
-    tickers = df_stocks.iloc[:, 0].astype(str).tolist()
-    
+    run = st.button("RUN SCANNER", type="primary")
+
+if run and tickers:
+    st.write(f"### Scanning {len(tickers)} stocks for '{pattern_choice}'...")
     results = []
-    progress = st.progress(0)
-    status_text = st.empty()
+    bar = st.progress(0)
     
     for i, t in enumerate(tickers):
-        status_text.text(f"Checking {t}...")
-        
-        # 1. SMART DATA FETCH
-        data, valid_ticker = get_valid_data(t)
-        
-        if data is not None and len(data) > 200:
-            # 2. GLOBAL SAFETY CHECK
-            if check_global_safety(data):
+        data, valid_symbol = get_valid_data(t)
+        if data is not None:
+            # Global Safety (Must be above 200 SMA)
+            sma200 = data.ta.sma(length=200).iloc[-1] if len(data) > 200 else 0
+            if data['Close'].iloc[-1] > sma200:
                 
-                # 3. PATTERN CHECK (Dual Mode)
-                if scan_method == "Standard Math (Fast)":
-                    setup = analyze_pattern_math(valid_ticker, data, target_pattern)
+                # --- DECISION LOGIC ---
+                match = False
+                setup = {}
+                
+                if mode == "Standard Math (Logic)":
+                    res = analyze_pattern_math(data, pattern_choice)
+                    if res["Match"]:
+                        match = True
+                        setup = res
+                        setup["Score"] = "Math Verified"
                 else:
-                    # Image Mode (Requires Ref Images)
-                    if ref_images:
-                        setup = analyze_pattern_visual(valid_ticker, data, ref_images)
-                    else:
-                        st.error("Please upload reference images for Visual Mode.")
-                        break
-                
-                # 4. SAVE IF MATCH
-                if setup["Match"]:
-                    results.append(setup)
-                    # Save data for chart view
-                    st.session_state[f"data_{valid_ticker}"] = data
-        
-        progress.progress((i + 1) / len(tickers))
-    
-    status_text.text("Scan Complete!")
-    
-    # --- DISPLAY RESULTS ---
-    if results:
-        st.success(f"✅ Found {len(results)} Opportunities")
-        results_df = pd.DataFrame(results).drop(columns=["Match"])
-        
-        # Display Interactive Table
-        st.dataframe(results_df.style.format({"Entry": "{:.2f}", "Stop_Loss": "{:.2f}", "Target": "{:.2f}"}))
-        
-        st.divider()
-        
-        # --- CHART VIEWER ---
-        st.header("📊 Pattern Visualizer")
-        selected_stock = st.selectbox("Select Stock to Inspect:", [r['Ticker'] for r in results])
-        
-        if selected_stock:
-            # Retrieve saved data and setup info
-            stock_data = st.session_state[f"data_{selected_stock}"]
-            stock_setup = next(item for item in results if item["Ticker"] == selected_stock)
-            
-            # Show Chart with Levels
-            plot_chart(selected_stock, stock_data, stock_setup)
-            
-            # Show Trading Plan Details
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("ENTRY", stock_setup['Entry'])
-            c2.metric("STOP LOSS", stock_setup['Stop_Loss'])
-            c3.metric("TARGET", stock_setup['Target'])
-            c4.info(f"**Trailing SL:** {stock_setup['Trailing_SL']}")
-            
-    else:
-        st.warning("No stocks matched your criteria today.")
+                    # Image Mode
+                    folder = PATTERN_FOLDERS.get(pattern_choice)
+                    if folder:
+                        score = analyze_pattern_visual(data, folder)
+                        if score > 40:
+                            match = True
+                            p = data['Close'].iloc[-1]
+                            setup = {
+                                "Entry": round(p*1.01, 2), 
+                                "Stop": round(p*0.95, 2), 
+                                "Target": round(p*1.15, 2),
+                                "Score": f"{round(score)}% Visual"
+                            }
 
-elif run_btn and not stock_file:
-    st.error("Please upload a CSV file first.")
+                if match:
+                    results.append({
+                        "Ticker": valid_symbol,
+                        "Price": round(data['Close'].iloc[-1], 2),
+                        "Type": setup["Score"],
+                        "Entry": setup["Entry"],
+                        "Stop": setup["Stop"],
+                        "Target": setup["Target"]
+                    })
+                    st.session_state[f"data_{valid_symbol}"] = data
+                    
+        bar.progress((i+1)/len(tickers))
+    
+    if results:
+        df_res = pd.DataFrame(results)
+        st.success(f"Found {len(results)} matches!")
+        st.dataframe(df_res)
+        
+        # Chart Viewer
+        st.divider()
+        sel = st.selectbox("Inspect Chart:", df_res['Ticker'].tolist())
+        if sel:
+            d = st.session_state[f"data_{sel}"]
+            row = df_res[df_res['Ticker'] == sel].iloc[0]
+            
+            ap = [
+                mpf.make_addplot([row['Entry']]*60, color='blue', linestyle='--'),
+                mpf.make_addplot([row['Stop']]*60, color='red', linestyle='--')
+            ]
+            fig, ax = mpf.plot(d.tail(60), type='candle', style='yahoo', volume=True, addplot=ap, returnfig=True, title=sel)
+            st.pyplot(fig)
+    else:
+        st.warning("No matches found.")
