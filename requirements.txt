@@ -3,13 +3,6 @@ yfinance
 pandas
 pandas_ta
 mplfinance
-opencv-python-headless
-numpy
 scipy
-streamlit
-yfinance
-pandas
-pandas_ta
-mplfinance
 opencv-python-headless
 numpy
